@@ -12,27 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package plugin
+package server
 
 import (
 	"github.com/fatedier/frp/pkg/msg"
 )
 
 type Request struct {
-	Version string      `json:"version"`
-	Op      string      `json:"op"`
-	Content interface{} `json:"content"`
+	Version string `json:"version"`
+	Op      string `json:"op"`
+	Content any    `json:"content"`
 }
 
 type Response struct {
-	Reject       bool        `json:"reject"`
-	RejectReason string      `json:"reject_reason"`
-	Unchange     bool        `json:"unchange"`
-	Content      interface{} `json:"content"`
+	Reject       bool   `json:"reject"`
+	RejectReason string `json:"reject_reason"`
+	Unchange     bool   `json:"unchange"`
+	Content      any    `json:"content"`
 }
 
 type LoginContent struct {
 	msg.Login
+
+	ClientAddress string `json:"client_address,omitempty"`
 }
 
 type UserInfo struct {
@@ -44,6 +46,11 @@ type UserInfo struct {
 type NewProxyContent struct {
 	User UserInfo `json:"user"`
 	msg.NewProxy
+}
+
+type CloseProxyContent struct {
+	User UserInfo `json:"user"`
+	msg.CloseProxy
 }
 
 type PingContent struct {

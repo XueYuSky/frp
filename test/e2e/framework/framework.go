@@ -3,17 +3,17 @@ package framework
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"text/template"
 
+	"github.com/onsi/ginkgo/v2"
+
+	"github.com/fatedier/frp/test/e2e/mock/server"
 	"github.com/fatedier/frp/test/e2e/pkg/port"
 	"github.com/fatedier/frp/test/e2e/pkg/process"
-
-	"github.com/onsi/ginkgo"
-	"github.com/onsi/ginkgo/config"
 )
 
 type Options struct {
@@ -25,17 +25,18 @@ type Options struct {
 
 type Framework struct {
 	TempDirectory string
-	UsedPorts     map[string]int
 
+	// ports used in this framework indexed by port name.
+	usedPorts map[string]int
+
+	// record ports allocated by this framework and release them after each test
+	allocatedPorts []int
+
+	// portAllocator to alloc port for this test case.
 	portAllocator *port.Allocator
 
-	// Multiple mock servers used for e2e testing.
+	// Multiple default mock servers used for e2e testing.
 	mockServers *MockServers
-
-	// To make sure that this framework cleans up after itself, no matter what,
-	// we install a Cleanup action before each test and clear it after.  If we
-	// should abort, the AfterSuite hook should run all Cleanup actions.
-	cleanupHandle CleanupActionHandle
 
 	// beforeEachStarted indicates that BeforeEach has started
 	beforeEachStarted bool
@@ -44,14 +45,24 @@ type Framework struct {
 	serverProcesses []*process.Process
 	clientConfPaths []string
 	clientProcesses []*process.Process
+
+	// Manual registered mock servers.
+	servers []server.Server
+
+	// used to generate unique config file name.
+	configFileIndex int64
+
+	// envs used to start processes, the form is `key=value`.
+	osEnvs []string
 }
 
 func NewDefaultFramework() *Framework {
+	suiteConfig, _ := ginkgo.GinkgoConfiguration()
 	options := Options{
-		TotalParallelNode: config.GinkgoConfig.ParallelTotal,
-		CurrentNodeIndex:  config.GinkgoConfig.ParallelNode,
-		FromPortIndex:     20000,
-		ToPortIndex:       50000,
+		TotalParallelNode: suiteConfig.ParallelTotal,
+		CurrentNodeIndex:  suiteConfig.ParallelProcess,
+		FromPortIndex:     10000,
+		ToPortIndex:       30000,
 	}
 	return NewFramework(options)
 }
@@ -59,6 +70,7 @@ func NewDefaultFramework() *Framework {
 func NewFramework(opt Options) *Framework {
 	f := &Framework{
 		portAllocator: port.NewAllocator(opt.FromPortIndex, opt.ToPortIndex, opt.TotalParallelNode, opt.CurrentNodeIndex-1),
+		usedPorts:     make(map[string]int),
 	}
 
 	ginkgo.BeforeEach(f.BeforeEach)
@@ -70,15 +82,22 @@ func NewFramework(opt Options) *Framework {
 func (f *Framework) BeforeEach() {
 	f.beforeEachStarted = true
 
-	f.cleanupHandle = AddCleanupAction(f.AfterEach)
-
-	dir, err := ioutil.TempDir(os.TempDir(), "frpe2e-test-*")
+	dir, err := os.MkdirTemp(os.TempDir(), "frp-e2e-test-*")
 	ExpectNoError(err)
 	f.TempDirectory = dir
 
 	f.mockServers = NewMockServers(f.portAllocator)
 	if err := f.mockServers.Run(); err != nil {
 		Failf("%v", err)
+	}
+
+	params := f.mockServers.GetTemplateParams()
+	for k, v := range params {
+		switch t := v.(type) {
+		case int:
+			f.usedPorts[k] = t
+		default:
+		}
 	}
 }
 
@@ -87,19 +106,17 @@ func (f *Framework) AfterEach() {
 		return
 	}
 
-	RemoveCleanupAction(f.cleanupHandle)
-
 	// stop processor
 	for _, p := range f.serverProcesses {
-		p.Stop()
-		if TestContext.Debug {
+		_ = p.Stop()
+		if TestContext.Debug || ginkgo.CurrentSpecReport().Failed() {
 			fmt.Println(p.ErrorOutput())
 			fmt.Println(p.StdOutput())
 		}
 	}
 	for _, p := range f.clientProcesses {
-		p.Stop()
-		if TestContext.Debug {
+		_ = p.Stop()
+		if TestContext.Debug || ginkgo.CurrentSpecReport().Failed() {
 			fmt.Println(p.ErrorOutput())
 			fmt.Println(p.StdOutput())
 		}
@@ -107,20 +124,34 @@ func (f *Framework) AfterEach() {
 	f.serverProcesses = nil
 	f.clientProcesses = nil
 
-	// close mock servers
+	// close default mock servers
 	f.mockServers.Close()
+
+	// close manual registered mock servers
+	for _, s := range f.servers {
+		s.Close()
+	}
 
 	// clean directory
 	os.RemoveAll(f.TempDirectory)
 	f.TempDirectory = ""
-	f.serverConfPaths = nil
-	f.clientConfPaths = nil
+	f.serverConfPaths = []string{}
+	f.clientConfPaths = []string{}
 
 	// release used ports
-	for _, port := range f.UsedPorts {
+	for _, port := range f.usedPorts {
 		f.portAllocator.Release(port)
 	}
-	f.UsedPorts = nil
+	f.usedPorts = make(map[string]int)
+
+	// release allocated ports
+	for _, port := range f.allocatedPorts {
+		f.portAllocator.Release(port)
+	}
+	f.allocatedPorts = make([]int, 0)
+
+	// clear os envs
+	f.osEnvs = make([]string, 0)
 }
 
 var portRegex = regexp.MustCompile(`{{ \.Port.*? }}`)
@@ -151,16 +182,16 @@ func (f *Framework) genPortsFromTemplates(templates []string) (ports map[string]
 	}()
 
 	for name := range ports {
-		port := f.portAllocator.Get()
+		port := f.portAllocator.GetByName(name)
 		if port <= 0 {
 			return nil, fmt.Errorf("can't allocate port")
 		}
 		ports[name] = port
 	}
 	return
-
 }
 
+// RenderTemplates alloc all ports for port names placeholder.
 func (f *Framework) RenderTemplates(templates []string) (outs []string, ports map[string]int, err error) {
 	ports, err = f.genPortsFromTemplates(templates)
 	if err != nil {
@@ -172,8 +203,12 @@ func (f *Framework) RenderTemplates(templates []string) (outs []string, ports ma
 		params[name] = port
 	}
 
+	for name, port := range f.usedPorts {
+		params[name] = port
+	}
+
 	for _, t := range templates {
-		tmpl, err := template.New("").Parse(t)
+		tmpl, err := template.New("frp-e2e").Parse(t)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -184,4 +219,60 @@ func (f *Framework) RenderTemplates(templates []string) (outs []string, ports ma
 		outs = append(outs, buffer.String())
 	}
 	return
+}
+
+func (f *Framework) PortByName(name string) int {
+	return f.usedPorts[name]
+}
+
+func (f *Framework) AllocPort() int {
+	port := f.portAllocator.Get()
+	ExpectTrue(port > 0, "alloc port failed")
+	f.allocatedPorts = append(f.allocatedPorts, port)
+	return port
+}
+
+func (f *Framework) AllocPortExcludingRanges(ranges ...[2]int) int {
+	for range 1000 {
+		port := f.portAllocator.Get()
+		ExpectTrue(port > 0, "alloc port failed")
+
+		inExcludedRange := false
+		for _, portRange := range ranges {
+			if port >= portRange[0] && port <= portRange[1] {
+				inExcludedRange = true
+				break
+			}
+		}
+		if inExcludedRange {
+			f.portAllocator.Release(port)
+			continue
+		}
+
+		f.allocatedPorts = append(f.allocatedPorts, port)
+		return port
+	}
+
+	Failf("alloc port outside excluded ranges failed")
+	return 0
+}
+
+func (f *Framework) RunServer(portName string, s server.Server) {
+	f.servers = append(f.servers, s)
+	if s.BindPort() > 0 && portName != "" {
+		f.usedPorts[portName] = s.BindPort()
+	}
+	err := s.Run()
+	ExpectNoError(err, "RunServer: with PortName %s", portName)
+}
+
+func (f *Framework) SetEnvs(envs []string) {
+	f.osEnvs = envs
+}
+
+func (f *Framework) WriteTempFile(name string, content string) string {
+	filePath := filepath.Join(f.TempDirectory, name)
+	err := os.WriteFile(filePath, []byte(content), 0o600)
+	ExpectNoError(err)
+	return filePath
 }

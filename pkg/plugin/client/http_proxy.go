@@ -12,82 +12,92 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package plugin
+//go:build !frps
+
+package client
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
-	frpNet "github.com/fatedier/frp/pkg/util/net"
+	libio "github.com/fatedier/golib/io"
+	libnet "github.com/fatedier/golib/net"
 
-	frpIo "github.com/fatedier/golib/io"
-	gnet "github.com/fatedier/golib/net"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
+	"github.com/fatedier/frp/pkg/util/util"
 )
 
-const PluginHTTPProxy = "http_proxy"
-
 func init() {
-	Register(PluginHTTPProxy, NewHTTPProxyPlugin)
+	Register(v1.PluginHTTPProxy, NewHTTPProxyPlugin)
 }
 
 type HTTPProxy struct {
-	l          *Listener
-	s          *http.Server
-	AuthUser   string
-	AuthPasswd string
+	opts *v1.HTTPProxyPluginOptions
+
+	l *Listener
+	s *http.Server
 }
 
-func NewHTTPProxyPlugin(params map[string]string) (Plugin, error) {
-	user := params["plugin_http_user"]
-	passwd := params["plugin_http_passwd"]
+const httpProxyReadHeaderTimeout = 60 * time.Second
+
+func NewHTTPProxyPlugin(_ PluginContext, options v1.ClientPluginOptions) (Plugin, error) {
+	opts := options.(*v1.HTTPProxyPluginOptions)
 	listener := NewProxyListener()
 
 	hp := &HTTPProxy{
-		l:          listener,
-		AuthUser:   user,
-		AuthPasswd: passwd,
+		l:    listener,
+		opts: opts,
 	}
 
 	hp.s = &http.Server{
-		Handler: hp,
+		Handler:           hp,
+		ReadHeaderTimeout: httpProxyReadHeaderTimeout,
 	}
 
-	go hp.s.Serve(listener)
+	go func() {
+		_ = hp.s.Serve(listener)
+	}()
 	return hp, nil
 }
 
 func (hp *HTTPProxy) Name() string {
-	return PluginHTTPProxy
+	return v1.PluginHTTPProxy
 }
 
-func (hp *HTTPProxy) Handle(conn io.ReadWriteCloser, realConn net.Conn, extraBufToLocal []byte) {
-	wrapConn := frpNet.WrapReadWriteCloserToConn(conn, realConn)
+func (hp *HTTPProxy) Handle(_ context.Context, connInfo *ConnectionInfo) {
+	wrapConn := netpkg.WrapReadWriteCloserToConn(connInfo.Conn, connInfo.UnderlyingConn)
 
-	sc, rd := gnet.NewSharedConn(wrapConn)
-	firstBytes := make([]byte, 7)
-	_, err := rd.Read(firstBytes)
+	sc, rd := libnet.NewSharedConn(wrapConn)
+	firstBytes := make([]byte, len(http.MethodConnect))
+	_ = wrapConn.SetReadDeadline(time.Now().Add(httpProxyReadHeaderTimeout))
+	_, err := io.ReadFull(rd, firstBytes)
 	if err != nil {
+		_ = wrapConn.SetReadDeadline(time.Time{})
 		wrapConn.Close()
 		return
 	}
 
-	if strings.ToUpper(string(firstBytes)) == "CONNECT" {
+	if strings.EqualFold(string(firstBytes), http.MethodConnect) {
 		bufRd := bufio.NewReader(sc)
 		request, err := http.ReadRequest(bufRd)
+		_ = wrapConn.SetReadDeadline(time.Time{})
 		if err != nil {
 			wrapConn.Close()
 			return
 		}
-		hp.handleConnectReq(request, frpIo.WrapReadWriteCloser(bufRd, wrapConn, wrapConn.Close))
+		hp.handleConnectReq(request, libio.WrapReadWriteCloser(bufRd, wrapConn, wrapConn.Close))
 		return
 	}
 
-	hp.l.PutConn(sc)
-	return
+	_ = wrapConn.SetReadDeadline(time.Time{})
+	_ = hp.l.PutConn(sc)
 }
 
 func (hp *HTTPProxy) Close() error {
@@ -103,13 +113,7 @@ func (hp *HTTPProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if req.Method == http.MethodConnect {
-		// deprecated
-		// Connect request is handled in Handle function.
-		hp.ConnectHandler(rw, req)
-	} else {
-		hp.HTTPHandler(rw, req)
-	}
+	hp.HTTPHandler(rw, req)
 }
 
 func (hp *HTTPProxy) HTTPHandler(rw http.ResponseWriter, req *http.Request) {
@@ -131,35 +135,8 @@ func (hp *HTTPProxy) HTTPHandler(rw http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// deprecated
-// Hijack needs to SetReadDeadline on the Conn of the request, but if we use stream compression here,
-// we may always get i/o timeout error.
-func (hp *HTTPProxy) ConnectHandler(rw http.ResponseWriter, req *http.Request) {
-	hj, ok := rw.(http.Hijacker)
-	if !ok {
-		rw.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	client, _, err := hj.Hijack()
-	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	remote, err := net.Dial("tcp", req.URL.Host)
-	if err != nil {
-		http.Error(rw, "Failed", http.StatusBadRequest)
-		client.Close()
-		return
-	}
-	client.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-
-	go frpIo.Join(remote, client)
-}
-
 func (hp *HTTPProxy) Auth(req *http.Request) bool {
-	if hp.AuthUser == "" && hp.AuthPasswd == "" {
+	if hp.opts.HTTPUser == "" && hp.opts.HTTPPassword == "" {
 		return true
 	}
 
@@ -178,7 +155,9 @@ func (hp *HTTPProxy) Auth(req *http.Request) bool {
 		return false
 	}
 
-	if pair[0] != hp.AuthUser || pair[1] != hp.AuthPasswd {
+	if !util.ConstantTimeEqString(pair[0], hp.opts.HTTPUser) ||
+		!util.ConstantTimeEqString(pair[1], hp.opts.HTTPPassword) {
+		time.Sleep(200 * time.Millisecond)
 		return false
 	}
 	return true
@@ -188,7 +167,10 @@ func (hp *HTTPProxy) handleConnectReq(req *http.Request, rwc io.ReadWriteCloser)
 	defer rwc.Close()
 	if ok := hp.Auth(req); !ok {
 		res := getBadResponse()
-		res.Write(rwc)
+		_ = res.Write(rwc)
+		if res.Body != nil {
+			res.Body.Close()
+		}
 		return
 	}
 
@@ -200,12 +182,12 @@ func (hp *HTTPProxy) handleConnectReq(req *http.Request, rwc io.ReadWriteCloser)
 			ProtoMajor: 1,
 			ProtoMinor: 1,
 		}
-		res.Write(rwc)
+		_ = res.Write(rwc)
 		return
 	}
-	rwc.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+	_, _ = rwc.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 
-	frpIo.Join(remote, rwc)
+	libio.Join(remote, rwc)
 }
 
 func copyHeaders(dst, src http.Header) {

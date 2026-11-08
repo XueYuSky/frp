@@ -15,61 +15,12 @@
 package auth
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/fatedier/frp/pkg/consts"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
 )
-
-type BaseConfig struct {
-	// AuthenticationMethod specifies what authentication method to use to
-	// authenticate frpc with frps. If "token" is specified - token will be
-	// read into login message. If "oidc" is specified - OIDC (Open ID Connect)
-	// token will be issued using OIDC settings. By default, this value is "token".
-	AuthenticationMethod string `ini:"authentication_method" json:"authentication_method"`
-	// AuthenticateHeartBeats specifies whether to include authentication token in
-	// heartbeats sent to frps. By default, this value is false.
-	AuthenticateHeartBeats bool `ini:"authenticate_heartbeats" json:"authenticate_heartbeats"`
-	// AuthenticateNewWorkConns specifies whether to include authentication token in
-	// new work connections sent to frps. By default, this value is false.
-	AuthenticateNewWorkConns bool `ini:"authenticate_new_work_conns" json:"authenticate_new_work_conns"`
-}
-
-func getDefaultBaseConf() BaseConfig {
-	return BaseConfig{
-		AuthenticationMethod:     "token",
-		AuthenticateHeartBeats:   false,
-		AuthenticateNewWorkConns: false,
-	}
-}
-
-type ClientConfig struct {
-	BaseConfig       `ini:",extends"`
-	OidcClientConfig `ini:",extends"`
-	TokenConfig      `ini:",extends"`
-}
-
-func GetDefaultClientConf() ClientConfig {
-	return ClientConfig{
-		BaseConfig:       getDefaultBaseConf(),
-		OidcClientConfig: getDefaultOidcClientConf(),
-		TokenConfig:      getDefaultTokenConf(),
-	}
-}
-
-type ServerConfig struct {
-	BaseConfig       `ini:",extends"`
-	OidcServerConfig `ini:",extends"`
-	TokenConfig      `ini:",extends"`
-}
-
-func GetDefaultServerConf() ServerConfig {
-	return ServerConfig{
-		BaseConfig:       getDefaultBaseConf(),
-		OidcServerConfig: getDefaultOidcServerConf(),
-		TokenConfig:      getDefaultTokenConf(),
-	}
-}
 
 type Setter interface {
 	SetLogin(*msg.Login) error
@@ -77,17 +28,56 @@ type Setter interface {
 	SetNewWorkConn(*msg.NewWorkConn) error
 }
 
-func NewAuthSetter(cfg ClientConfig) (authProvider Setter) {
-	switch cfg.AuthenticationMethod {
-	case consts.TokenAuthMethod:
-		authProvider = NewTokenAuth(cfg.BaseConfig, cfg.TokenConfig)
-	case consts.OidcAuthMethod:
-		authProvider = NewOidcAuthSetter(cfg.BaseConfig, cfg.OidcClientConfig)
-	default:
-		panic(fmt.Sprintf("wrong authentication method: '%s'", cfg.AuthenticationMethod))
-	}
+type ClientAuth struct {
+	Setter Setter
+	key    []byte
+}
 
-	return authProvider
+func (a *ClientAuth) EncryptionKey() []byte {
+	return a.key
+}
+
+// BuildClientAuth resolves any dynamic auth values and returns a prepared auth runtime.
+// Caller must run validation before calling this function.
+func BuildClientAuth(cfg *v1.AuthClientConfig) (*ClientAuth, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("auth config is nil")
+	}
+	resolved := *cfg
+	if resolved.Method == v1.AuthMethodToken && resolved.TokenSource != nil {
+		token, err := resolved.TokenSource.Resolve(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve auth.tokenSource: %w", err)
+		}
+		resolved.Token = token
+	}
+	setter, err := NewAuthSetter(resolved)
+	if err != nil {
+		return nil, err
+	}
+	return &ClientAuth{
+		Setter: setter,
+		key:    []byte(resolved.Token),
+	}, nil
+}
+
+func NewAuthSetter(cfg v1.AuthClientConfig) (authProvider Setter, err error) {
+	switch cfg.Method {
+	case v1.AuthMethodToken:
+		authProvider = NewTokenAuth(cfg.AdditionalScopes, cfg.Token)
+	case v1.AuthMethodOIDC:
+		if cfg.OIDC.TokenSource != nil {
+			authProvider = NewOidcTokenSourceAuthSetter(cfg.AdditionalScopes, cfg.OIDC.TokenSource)
+		} else {
+			authProvider, err = NewOidcAuthSetter(cfg.AdditionalScopes, cfg.OIDC)
+			if err != nil {
+				return nil, err
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unsupported auth method: %s", cfg.Method)
+	}
+	return authProvider, nil
 }
 
 type Verifier interface {
@@ -96,13 +86,42 @@ type Verifier interface {
 	VerifyNewWorkConn(*msg.NewWorkConn) error
 }
 
-func NewAuthVerifier(cfg ServerConfig) (authVerifier Verifier) {
-	switch cfg.AuthenticationMethod {
-	case consts.TokenAuthMethod:
-		authVerifier = NewTokenAuth(cfg.BaseConfig, cfg.TokenConfig)
-	case consts.OidcAuthMethod:
-		authVerifier = NewOidcAuthVerifier(cfg.BaseConfig, cfg.OidcServerConfig)
-	}
+type ServerAuth struct {
+	Verifier Verifier
+	key      []byte
+}
 
+func (a *ServerAuth) EncryptionKey() []byte {
+	return a.key
+}
+
+// BuildServerAuth resolves any dynamic auth values and returns a prepared auth runtime.
+// Caller must run validation before calling this function.
+func BuildServerAuth(cfg *v1.AuthServerConfig) (*ServerAuth, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("auth config is nil")
+	}
+	resolved := *cfg
+	if resolved.Method == v1.AuthMethodToken && resolved.TokenSource != nil {
+		token, err := resolved.TokenSource.Resolve(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve auth.tokenSource: %w", err)
+		}
+		resolved.Token = token
+	}
+	return &ServerAuth{
+		Verifier: NewAuthVerifier(resolved),
+		key:      []byte(resolved.Token),
+	}, nil
+}
+
+func NewAuthVerifier(cfg v1.AuthServerConfig) (authVerifier Verifier) {
+	switch cfg.Method {
+	case v1.AuthMethodToken:
+		authVerifier = NewTokenAuth(cfg.AdditionalScopes, cfg.Token)
+	case v1.AuthMethodOIDC:
+		tokenVerifier := NewTokenVerifier(cfg.OIDC)
+		authVerifier = NewOidcAuthVerifier(cfg.AdditionalScopes, tokenVerifier)
+	}
 	return authVerifier
 }

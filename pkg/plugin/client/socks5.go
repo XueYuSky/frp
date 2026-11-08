@@ -12,41 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package plugin
+//go:build !frps
+
+package client
 
 import (
+	"context"
 	"io"
-	"io/ioutil"
 	"log"
-	"net"
-
-	frpNet "github.com/fatedier/frp/pkg/util/net"
 
 	gosocks5 "github.com/armon/go-socks5"
+
+	v1 "github.com/fatedier/frp/pkg/config/v1"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
 )
 
-const PluginSocks5 = "socks5"
-
 func init() {
-	Register(PluginSocks5, NewSocks5Plugin)
+	Register(v1.PluginSocks5, NewSocks5Plugin)
 }
 
 type Socks5Plugin struct {
 	Server *gosocks5.Server
-
-	user   string
-	passwd string
 }
 
-func NewSocks5Plugin(params map[string]string) (p Plugin, err error) {
-	user := params["plugin_user"]
-	passwd := params["plugin_passwd"]
+func NewSocks5Plugin(_ PluginContext, options v1.ClientPluginOptions) (p Plugin, err error) {
+	opts := options.(*v1.Socks5PluginOptions)
 
 	cfg := &gosocks5.Config{
-		Logger: log.New(ioutil.Discard, "", log.LstdFlags),
+		Logger: log.New(io.Discard, "", log.LstdFlags),
 	}
-	if user != "" || passwd != "" {
-		cfg.Credentials = gosocks5.StaticCredentials(map[string]string{user: passwd})
+	if opts.Username != "" || opts.Password != "" {
+		cfg.Credentials = gosocks5.StaticCredentials(map[string]string{opts.Username: opts.Password})
 	}
 	sp := &Socks5Plugin{}
 	sp.Server, err = gosocks5.New(cfg)
@@ -54,14 +50,14 @@ func NewSocks5Plugin(params map[string]string) (p Plugin, err error) {
 	return
 }
 
-func (sp *Socks5Plugin) Handle(conn io.ReadWriteCloser, realConn net.Conn, extraBufToLocal []byte) {
-	defer conn.Close()
-	wrapConn := frpNet.WrapReadWriteCloserToConn(conn, realConn)
-	sp.Server.ServeConn(wrapConn)
+func (sp *Socks5Plugin) Handle(_ context.Context, connInfo *ConnectionInfo) {
+	defer connInfo.Conn.Close()
+	wrapConn := netpkg.WrapReadWriteCloserToConn(connInfo.Conn, connInfo.UnderlyingConn)
+	_ = sp.Server.ServeConn(wrapConn)
 }
 
 func (sp *Socks5Plugin) Name() string {
-	return PluginSocks5
+	return v1.PluginSocks5
 }
 
 func (sp *Socks5Plugin) Close() error {

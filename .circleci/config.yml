@@ -1,25 +1,26 @@
-version: 2
+version: 2.1
 jobs:
-  test1:
+  go-version-latest:
     docker:
-      - image: circleci/golang:1.16-node
-    working_directory: /go/src/github.com/fatedier/frp
+    - image: cimg/go:1.26-node
+    resource_class: large
     steps:
-      - checkout
-      - run: make
-      - run: make alltest
-  test2:
-    docker:
-      - image: circleci/golang:1.15-node
-    working_directory: /go/src/github.com/fatedier/frp
-    steps:
-      - checkout
-      - run: make
-      - run: make alltest
+    - checkout
+    - run:
+        name: Test and build web assets
+        command: make web-ci
+    - run:
+        name: Check Go formatting and build binaries
+        command: |
+          set -e
+          make env fmt
+          git diff --exit-code
+          make build
+    - run:
+        name: Run all tests
+        command: make alltest
 
 workflows:
-  version: 2
   build_and_test:
     jobs:
-      - test1
-      - test2
+    - go-version-latest

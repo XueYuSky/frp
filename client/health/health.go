@@ -19,17 +19,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/util/xlog"
 )
 
-var (
-	ErrHealthCheckType = errors.New("error health check type")
-)
+var ErrHealthCheckType = errors.New("error health check type")
+
+func newHealthTimer(interval time.Duration) (<-chan time.Time, func()) {
+	timer := time.NewTimer(interval)
+	return timer.C, func() { timer.Stop() }
+}
 
 type Monitor struct {
 	checkType      string
@@ -41,8 +45,8 @@ type Monitor struct {
 	addr string
 
 	// For http
-	url string
-
+	url            string
+	header         http.Header
 	failedTimes    uint64
 	statusOK       bool
 	statusNormalFn func()
@@ -50,35 +54,53 @@ type Monitor struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	doneCh chan struct{}
+
+	timerFactory func(time.Duration) (<-chan time.Time, func())
 }
 
-func NewMonitor(ctx context.Context, checkType string,
-	intervalS int, timeoutS int, maxFailedTimes int,
-	addr string, url string,
-	statusNormalFn func(), statusFailedFn func()) *Monitor {
-
-	if intervalS <= 0 {
-		intervalS = 10
+func NewMonitor(ctx context.Context, cfg v1.HealthCheckConfig, addr string,
+	statusNormalFn func(), statusFailedFn func(),
+) *Monitor {
+	if cfg.IntervalSeconds <= 0 {
+		cfg.IntervalSeconds = 10
 	}
-	if timeoutS <= 0 {
-		timeoutS = 3
+	if cfg.TimeoutSeconds <= 0 {
+		cfg.TimeoutSeconds = 3
 	}
-	if maxFailedTimes <= 0 {
-		maxFailedTimes = 1
+	if cfg.MaxFailed <= 0 {
+		cfg.MaxFailed = 1
 	}
 	newctx, cancel := context.WithCancel(ctx)
+
+	var url string
+	if cfg.Type == "http" && cfg.Path != "" {
+		s := "http://" + addr
+		if !strings.HasPrefix(cfg.Path, "/") {
+			s += "/"
+		}
+		url = s + cfg.Path
+	}
+	header := make(http.Header)
+	for _, h := range cfg.HTTPHeaders {
+		header.Set(h.Name, h.Value)
+	}
+
 	return &Monitor{
-		checkType:      checkType,
-		interval:       time.Duration(intervalS) * time.Second,
-		timeout:        time.Duration(timeoutS) * time.Second,
-		maxFailedTimes: maxFailedTimes,
+		checkType:      cfg.Type,
+		interval:       time.Duration(cfg.IntervalSeconds) * time.Second,
+		timeout:        time.Duration(cfg.TimeoutSeconds) * time.Second,
+		maxFailedTimes: cfg.MaxFailed,
 		addr:           addr,
 		url:            url,
+		header:         header,
 		statusOK:       false,
 		statusNormalFn: statusNormalFn,
 		statusFailedFn: statusFailedFn,
 		ctx:            newctx,
 		cancel:         cancel,
+		doneCh:         make(chan struct{}),
+		timerFactory:   newHealthTimer,
 	}
 }
 
@@ -90,39 +112,66 @@ func (monitor *Monitor) Stop() {
 	monitor.cancel()
 }
 
+// Done is closed when the worker launched by Start has exited.
+func (monitor *Monitor) Done() <-chan struct{} {
+	return monitor.doneCh
+}
+
 func (monitor *Monitor) checkWorker() {
-	xl := xlog.FromContextSafe(monitor.ctx)
+	defer close(monitor.doneCh)
+
 	for {
+		if monitor.ctx.Err() != nil {
+			return
+		}
+
 		doCtx, cancel := context.WithDeadline(monitor.ctx, time.Now().Add(monitor.timeout))
 		err := monitor.doCheck(doCtx)
+		cancel()
 
 		// check if this monitor has been closed
-		select {
-		case <-monitor.ctx.Done():
-			cancel()
+		if monitor.ctx.Err() != nil {
 			return
-		default:
-			cancel()
 		}
+		monitor.handleCheckResult(err)
 
-		if err == nil {
-			xl.Trace("do one health check success")
-			if !monitor.statusOK && monitor.statusNormalFn != nil {
-				xl.Info("health check status change to success")
-				monitor.statusOK = true
-				monitor.statusNormalFn()
-			}
-		} else {
-			xl.Warn("do one health check failed: %v", err)
-			monitor.failedTimes++
-			if monitor.statusOK && int(monitor.failedTimes) >= monitor.maxFailedTimes && monitor.statusFailedFn != nil {
-				xl.Warn("health check status change to failed")
-				monitor.statusOK = false
-				monitor.statusFailedFn()
-			}
+		if !monitor.waitForNextCheck() {
+			return
 		}
+	}
+}
 
-		time.Sleep(monitor.interval)
+func (monitor *Monitor) handleCheckResult(err error) {
+	xl := xlog.FromContextSafe(monitor.ctx)
+	if err == nil {
+		xl.Tracef("do one health check success")
+		monitor.failedTimes = 0
+		if !monitor.statusOK && monitor.statusNormalFn != nil {
+			xl.Infof("health check status change to success")
+			monitor.statusOK = true
+			monitor.statusNormalFn()
+		}
+		return
+	}
+
+	xl.Warnf("do one health check failed: %v", err)
+	monitor.failedTimes++
+	if monitor.statusOK && int(monitor.failedTimes) >= monitor.maxFailedTimes && monitor.statusFailedFn != nil {
+		xl.Warnf("health check status change to failed")
+		monitor.statusOK = false
+		monitor.statusFailedFn()
+	}
+}
+
+func (monitor *Monitor) waitForNextCheck() bool {
+	timerC, stopTimer := monitor.timerFactory(monitor.interval)
+	defer stopTimer()
+
+	select {
+	case <-monitor.ctx.Done():
+		return false
+	case <-timerC:
+		return monitor.ctx.Err() == nil
 	}
 }
 
@@ -153,16 +202,18 @@ func (monitor *Monitor) doTCPCheck(ctx context.Context) error {
 }
 
 func (monitor *Monitor) doHTTPCheck(ctx context.Context) error {
-	req, err := http.NewRequest("GET", monitor.url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", monitor.url, nil)
 	if err != nil {
 		return err
 	}
+	req.Header = monitor.header
+	req.Host = monitor.header.Get("Host")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	io.Copy(ioutil.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("do http health check, StatusCode is [%d] not 2xx", resp.StatusCode)

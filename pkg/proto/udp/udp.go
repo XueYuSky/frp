@@ -15,28 +15,29 @@
 package udp
 
 import (
-	"encoding/base64"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/fatedier/frp/pkg/msg"
-
 	"github.com/fatedier/golib/errors"
 	"github.com/fatedier/golib/pool"
+
+	"github.com/fatedier/frp/pkg/msg"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
 )
 
 func NewUDPPacket(buf []byte, laddr, raddr *net.UDPAddr) *msg.UDPPacket {
+	content := make([]byte, len(buf))
+	copy(content, buf)
 	return &msg.UDPPacket{
-		Content:    base64.StdEncoding.EncodeToString(buf),
+		Content:    content,
 		LocalAddr:  laddr,
 		RemoteAddr: raddr,
 	}
 }
 
 func GetContent(m *msg.UDPPacket) (buf []byte, err error) {
-	buf, err = base64.StdEncoding.DecodeString(m.Content)
-	return
+	return m.Content, nil
 }
 
 func ForwardUserConn(udpConn *net.UDPConn, readCh <-chan *msg.UDPPacket, sendCh chan<- *msg.UDPPacket, bufSize int) {
@@ -47,7 +48,7 @@ func ForwardUserConn(udpConn *net.UDPConn, readCh <-chan *msg.UDPPacket, sendCh 
 			if err != nil {
 				continue
 			}
-			udpConn.WriteToUDP(buf, udpMsg.RemoteAddr)
+			_, _ = udpConn.WriteToUDP(buf, udpMsg.RemoteAddr)
 		}
 	}()
 
@@ -59,20 +60,22 @@ func ForwardUserConn(udpConn *net.UDPConn, readCh <-chan *msg.UDPPacket, sendCh 
 		if err != nil {
 			return
 		}
-		// buf[:n] will be encoded to string, so the bytes can be reused
+		// NewUDPPacket copies buf[:n], so the read buffer can be reused
 		udpMsg := NewUDPPacket(buf[:n], nil, remoteAddr)
 
-		select {
-		case sendCh <- udpMsg:
-		default:
+		if err = errors.PanicToError(func() {
+			select {
+			case sendCh <- udpMsg:
+			default:
+			}
+		}); err != nil {
+			return
 		}
 	}
 }
 
-func Forwarder(dstAddr *net.UDPAddr, readCh <-chan *msg.UDPPacket, sendCh chan<- msg.Message, bufSize int) {
-	var (
-		mu sync.RWMutex
-	)
+func Forwarder(dstAddr *net.UDPAddr, readCh <-chan *msg.UDPPacket, sendCh chan<- msg.Message, bufSize int, proxyProtocolVersion string) {
+	var mu sync.RWMutex
 	udpConnMap := make(map[string]*net.UDPConn)
 
 	// read from dstAddr and write to sendCh
@@ -86,8 +89,9 @@ func Forwarder(dstAddr *net.UDPAddr, readCh <-chan *msg.UDPPacket, sendCh chan<-
 		}()
 
 		buf := pool.GetBuf(bufSize)
+		defer pool.PutBuf(buf)
 		for {
-			udpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			_ = udpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			n, _, err := udpConn.ReadFromUDP(buf)
 			if err != nil {
 				return
@@ -112,6 +116,7 @@ func Forwarder(dstAddr *net.UDPAddr, readCh <-chan *msg.UDPPacket, sendCh chan<-
 			if err != nil {
 				continue
 			}
+
 			mu.Lock()
 			udpConn, ok := udpConnMap[udpMsg.RemoteAddr.String()]
 			if !ok {
@@ -124,9 +129,23 @@ func Forwarder(dstAddr *net.UDPAddr, readCh <-chan *msg.UDPPacket, sendCh chan<-
 			}
 			mu.Unlock()
 
+			// Add proxy protocol header if configured (only for the first packet of a new connection)
+			if !ok && proxyProtocolVersion != "" && udpMsg.RemoteAddr != nil {
+				ppBuf, err := netpkg.BuildProxyProtocolHeader(udpMsg.RemoteAddr, dstAddr, proxyProtocolVersion)
+				if err == nil {
+					// Prepend proxy protocol header to the UDP payload
+					finalBuf := make([]byte, len(ppBuf)+len(buf))
+					copy(finalBuf, ppBuf)
+					copy(finalBuf[len(ppBuf):], buf)
+					buf = finalBuf
+				}
+			}
+
 			_, err = udpConn.Write(buf)
 			if err != nil {
 				udpConn.Close()
+			} else {
+				_ = udpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			}
 
 			if !ok {

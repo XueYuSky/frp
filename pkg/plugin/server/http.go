@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package plugin
+package server
 
 import (
 	"bytes"
@@ -20,35 +20,30 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"reflect"
+	"slices"
 	"strings"
+
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 )
 
-type HTTPPluginOptions struct {
-	Name      string   `ini:"name"`
-	Addr      string   `ini:"addr"`
-	Path      string   `ini:"path"`
-	Ops       []string `ini:"ops"`
-	TLSVerify bool     `ini:"tls_verify"`
-}
-
 type httpPlugin struct {
-	options HTTPPluginOptions
+	options v1.HTTPPluginOptions
 
 	url    string
 	client *http.Client
 }
 
-func NewHTTPPluginOptions(options HTTPPluginOptions) Plugin {
-	var url = fmt.Sprintf("%s%s", options.Addr, options.Path)
+func NewHTTPPluginOptions(options v1.HTTPPluginOptions) Plugin {
+	url := fmt.Sprintf("%s%s", options.Addr, options.Path)
 
 	var client *http.Client
 	if strings.HasPrefix(url, "https://") {
 		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: options.TLSVerify == false},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: !options.TLSVerify},
 		}
 		client = &http.Client{Transport: tr}
 	} else {
@@ -70,15 +65,10 @@ func (p *httpPlugin) Name() string {
 }
 
 func (p *httpPlugin) IsSupport(op string) bool {
-	for _, v := range p.options.Ops {
-		if v == op {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(p.options.Ops, op)
 }
 
-func (p *httpPlugin) Handle(ctx context.Context, op string, content interface{}) (*Response, interface{}, error) {
+func (p *httpPlugin) Handle(ctx context.Context, op string, content any) (*Response, any, error) {
 	r := &Request{
 		Version: APIVersion,
 		Op:      op,
@@ -116,12 +106,9 @@ func (p *httpPlugin) do(ctx context.Context, r *Request, res *Response) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("do http request error code: %d", resp.StatusCode)
 	}
-	buf, err = ioutil.ReadAll(resp.Body)
+	buf, err = io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
-	if err = json.Unmarshal(buf, res); err != nil {
-		return err
-	}
-	return nil
+	return json.Unmarshal(buf, res)
 }

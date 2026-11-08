@@ -1,7 +1,16 @@
-.PHONY: dist build
+.PHONY: dist install build preview lint
 
-build:
+install:
+	@cd .. && npm install
+
+build: install
 	@npm run build
 
-dev: install
+dev:
 	@npm run dev
+
+preview:
+	@npm run preview
+
+lint:
+	@npm run lint

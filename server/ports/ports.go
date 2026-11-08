@@ -2,10 +2,14 @@ package ports
 
 import (
 	"errors"
-	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
+
+	"k8s.io/utils/clock"
+
+	"github.com/fatedier/frp/pkg/config/types"
 )
 
 const (
@@ -36,20 +40,35 @@ type Manager struct {
 
 	bindAddr string
 	netType  string
+	clock    clock.WithTicker
 	mu       sync.Mutex
 }
 
-func NewManager(netType string, bindAddr string, allowPorts map[int]struct{}) *Manager {
+func NewManager(netType string, bindAddr string, allowPorts []types.PortsRange) *Manager {
+	return newManagerWithClock(netType, bindAddr, allowPorts, clock.RealClock{})
+}
+
+func newManagerWithClock(netType string, bindAddr string, allowPorts []types.PortsRange, clk clock.WithTicker) *Manager {
+	if clk == nil {
+		clk = clock.RealClock{}
+	}
 	pm := &Manager{
 		reservedPorts: make(map[string]*PortCtx),
 		usedPorts:     make(map[int]*PortCtx),
 		freePorts:     make(map[int]struct{}),
 		bindAddr:      bindAddr,
 		netType:       netType,
+		clock:         clk,
 	}
 	if len(allowPorts) > 0 {
-		for port := range allowPorts {
-			pm.freePorts[port] = struct{}{}
+		for _, pair := range allowPorts {
+			if pair.Single > 0 {
+				pm.freePorts[pair.Single] = struct{}{}
+			} else {
+				for i := pair.Start; i <= pair.End; i++ {
+					pm.freePorts[i] = struct{}{}
+				}
+			}
 		}
 	} else {
 		for i := MinPort; i <= MaxPort; i++ {
@@ -64,7 +83,7 @@ func (pm *Manager) Acquire(name string, port int) (realPort int, err error) {
 	portCtx := &PortCtx{
 		ProxyName:  name,
 		Closed:     false,
-		UpdateTime: time.Now(),
+		UpdateTime: pm.clock.Now(),
 	}
 
 	var ok bool
@@ -82,9 +101,7 @@ func (pm *Manager) Acquire(name string, port int) (realPort int, err error) {
 		if ctx, ok := pm.reservedPorts[name]; ok {
 			if pm.isPortAvailable(ctx.Port) {
 				realPort = ctx.Port
-				pm.usedPorts[realPort] = portCtx
-				pm.reservedPorts[name] = portCtx
-				delete(pm.freePorts, realPort)
+				pm.markPortAcquiredLocked(name, realPort, portCtx)
 				return
 			}
 		}
@@ -101,9 +118,7 @@ func (pm *Manager) Acquire(name string, port int) (realPort int, err error) {
 			}
 			if pm.isPortAvailable(k) {
 				realPort = k
-				pm.usedPorts[realPort] = portCtx
-				pm.reservedPorts[name] = portCtx
-				delete(pm.freePorts, realPort)
+				pm.markPortAcquiredLocked(name, realPort, portCtx)
 				break
 			}
 		}
@@ -115,9 +130,7 @@ func (pm *Manager) Acquire(name string, port int) (realPort int, err error) {
 		if _, ok = pm.freePorts[port]; ok {
 			if pm.isPortAvailable(port) {
 				realPort = port
-				pm.usedPorts[realPort] = portCtx
-				pm.reservedPorts[name] = portCtx
-				delete(pm.freePorts, realPort)
+				pm.markPortAcquiredLocked(name, realPort, portCtx)
 			} else {
 				err = ErrPortUnAvailable
 			}
@@ -132,9 +145,16 @@ func (pm *Manager) Acquire(name string, port int) (realPort int, err error) {
 	return
 }
 
+// markPortAcquiredLocked records a successful acquisition. pm.mu must be held.
+func (pm *Manager) markPortAcquiredLocked(name string, port int, portCtx *PortCtx) {
+	pm.usedPorts[port] = portCtx
+	pm.reservedPorts[name] = portCtx
+	delete(pm.freePorts, port)
+}
+
 func (pm *Manager) isPortAvailable(port int) bool {
 	if pm.netType == "udp" {
-		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", pm.bindAddr, port))
+		addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(pm.bindAddr, strconv.Itoa(port)))
 		if err != nil {
 			return false
 		}
@@ -146,7 +166,7 @@ func (pm *Manager) isPortAvailable(port int) bool {
 		return true
 	}
 
-	l, err := net.Listen(pm.netType, fmt.Sprintf("%s:%d", pm.bindAddr, port))
+	l, err := net.Listen(pm.netType, net.JoinHostPort(pm.bindAddr, strconv.Itoa(port)))
 	if err != nil {
 		return false
 	}
@@ -161,20 +181,36 @@ func (pm *Manager) Release(port int) {
 		pm.freePorts[port] = struct{}{}
 		delete(pm.usedPorts, port)
 		ctx.Closed = true
-		ctx.UpdateTime = time.Now()
+		ctx.UpdateTime = pm.clock.Now()
 	}
 }
 
 // Release reserved port if it isn't used in last 24 hours.
 func (pm *Manager) cleanReservedPortsWorker() {
+	pm.cleanReservedPortsWorkerUntil(nil)
+}
+
+func (pm *Manager) cleanReservedPortsWorkerUntil(stopCh <-chan struct{}) {
+	ticker := pm.clock.NewTicker(CleanReservedPortsInterval)
+	defer ticker.Stop()
+
 	for {
-		time.Sleep(CleanReservedPortsInterval)
-		pm.mu.Lock()
-		for name, ctx := range pm.reservedPorts {
-			if ctx.Closed && time.Since(ctx.UpdateTime) > MaxPortReservedDuration {
-				delete(pm.reservedPorts, name)
-			}
+		select {
+		case <-ticker.C():
+			pm.cleanReservedPortsOnce()
+		case <-stopCh:
+			return
 		}
-		pm.mu.Unlock()
+	}
+}
+
+func (pm *Manager) cleanReservedPortsOnce() {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	for name, ctx := range pm.reservedPorts {
+		if ctx.Closed && pm.clock.Since(ctx.UpdateTime) > MaxPortReservedDuration {
+			delete(pm.reservedPorts, name)
+		}
 	}
 }

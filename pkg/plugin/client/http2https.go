@@ -12,100 +12,54 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package plugin
+//go:build !frps
+
+package client
 
 import (
 	"crypto/tls"
-	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"net/http/httputil"
-	"strings"
 
-	frpNet "github.com/fatedier/frp/pkg/util/net"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 )
 
-const PluginHTTP2HTTPS = "http2https"
-
 func init() {
-	Register(PluginHTTP2HTTPS, NewHTTP2HTTPSPlugin)
+	Register(v1.PluginHTTP2HTTPS, NewHTTP2HTTPSPlugin)
 }
 
 type HTTP2HTTPSPlugin struct {
-	hostHeaderRewrite string
-	localAddr         string
-	headers           map[string]string
+	opts *v1.HTTP2HTTPSPluginOptions
 
-	l *Listener
-	s *http.Server
+	*httpBridgePlugin
 }
 
-func NewHTTP2HTTPSPlugin(params map[string]string) (Plugin, error) {
-	localAddr := params["plugin_local_addr"]
-	hostHeaderRewrite := params["plugin_host_header_rewrite"]
-	headers := make(map[string]string)
-	for k, v := range params {
-		if !strings.HasPrefix(k, "plugin_header_") {
-			continue
-		}
-		if k = strings.TrimPrefix(k, "plugin_header_"); k != "" {
-			headers[k] = v
-		}
-	}
+func NewHTTP2HTTPSPlugin(_ PluginContext, options v1.ClientPluginOptions) (Plugin, error) {
+	opts := options.(*v1.HTTP2HTTPSPluginOptions)
 
-	if localAddr == "" {
-		return nil, fmt.Errorf("plugin_local_addr is required")
-	}
-
-	listener := NewProxyListener()
-
-	p := &HTTPS2HTTPPlugin{
-		localAddr:         localAddr,
-		hostHeaderRewrite: hostHeaderRewrite,
-		headers:           headers,
-		l:                 listener,
+	p := &HTTP2HTTPSPlugin{
+		opts: opts,
 	}
 
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 
-	rp := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = "https"
-			req.URL.Host = p.localAddr
-			if p.hostHeaderRewrite != "" {
-				req.Host = p.hostHeaderRewrite
-			}
-			for k, v := range p.headers {
-				req.Header.Set(k, v)
-			}
+	rp := newHTTPBridgeReverseProxy(
+		func(r *httputil.ProxyRequest) {
+			r.Out.Header["X-Forwarded-For"] = r.In.Header["X-Forwarded-For"]
+			r.Out.Header["X-Forwarded-Host"] = r.In.Header["X-Forwarded-Host"]
+			r.Out.Header["X-Forwarded-Proto"] = r.In.Header["X-Forwarded-Proto"]
+			req := r.Out
+			rewriteHTTPPluginRequest(req, "https", p.opts.LocalAddr, p.opts.HostHeaderRewrite, p.opts.RequestHeaders)
 		},
-		Transport: tr,
-	}
-
-	p.s = &http.Server{
-		Handler: rp,
-	}
-
-	go p.s.Serve(listener)
+		tr,
+	)
+	p.httpBridgePlugin = newHTTPBridgePluginServer(rp, false)
 
 	return p, nil
 }
 
-func (p *HTTP2HTTPSPlugin) Handle(conn io.ReadWriteCloser, realConn net.Conn, extraBufToLocal []byte) {
-	wrapConn := frpNet.WrapReadWriteCloserToConn(conn, realConn)
-	p.l.PutConn(wrapConn)
-}
-
 func (p *HTTP2HTTPSPlugin) Name() string {
-	return PluginHTTP2HTTPS
-}
-
-func (p *HTTP2HTTPSPlugin) Close() error {
-	if err := p.s.Close(); err != nil {
-		return err
-	}
-	return nil
+	return v1.PluginHTTP2HTTPS
 }

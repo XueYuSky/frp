@@ -3,13 +3,16 @@ package port
 import (
 	"fmt"
 	"net"
+	"strconv"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 type Allocator struct {
-	reserved sets.Int
-	used     sets.Int
+	reserved sets.Set[int]
+	used     sets.Set[int]
+	mu       sync.Mutex
 }
 
 // NewAllocator return a port allocator for testing.
@@ -17,9 +20,10 @@ type Allocator struct {
 // Reserved ports: 13, 17
 func NewAllocator(from int, to int, mod int, index int) *Allocator {
 	pa := &Allocator{
-		reserved: sets.NewInt(),
-		used:     sets.NewInt(),
+		reserved: sets.New[int](),
+		used:     sets.New[int](),
 	}
+
 	for i := from; i <= to; i++ {
 		if i%mod == index {
 			pa.reserved.Insert(i)
@@ -29,27 +33,82 @@ func NewAllocator(from int, to int, mod int, index int) *Allocator {
 }
 
 func (pa *Allocator) Get() int {
-	for i := 0; i < 10; i++ {
-		port, _ := pa.reserved.PopAny()
+	return pa.GetByName("")
+}
+
+func (pa *Allocator) GetByName(portName string) int {
+	var builder *nameBuilder
+	if portName == "" {
+		builder = &nameBuilder{}
+	} else {
+		var err error
+		builder, err = unmarshalFromName(portName)
+		if err != nil {
+			fmt.Println(err, portName)
+			return 0
+		}
+	}
+
+	pa.mu.Lock()
+	defer pa.mu.Unlock()
+
+	for range 20 {
+		port := pa.getByRange(builder.rangePortFrom, builder.rangePortTo)
 		if port == 0 {
 			return 0
 		}
 
-		// TODO: Distinguish between TCP and UDP
-		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		l, err := net.Listen("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
 		if err != nil {
 			// Maybe not controlled by us, mark it used.
 			pa.used.Insert(port)
 			continue
 		}
 		l.Close()
+
+		udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
+		if err != nil {
+			continue
+		}
+		udpConn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			// Maybe not controlled by us, mark it used.
+			pa.used.Insert(port)
+			continue
+		}
+		udpConn.Close()
+
 		pa.used.Insert(port)
+		pa.reserved.Delete(port)
 		return port
 	}
 	return 0
 }
 
+func (pa *Allocator) getByRange(from, to int) int {
+	if from <= 0 {
+		port, _ := pa.reserved.PopAny()
+		return port
+	}
+
+	// choose a random port between from - to
+	ports := pa.reserved.UnsortedList()
+	for _, port := range ports {
+		if port >= from && port <= to {
+			return port
+		}
+	}
+	return 0
+}
+
 func (pa *Allocator) Release(port int) {
+	if port <= 0 {
+		return
+	}
+
+	pa.mu.Lock()
+	defer pa.mu.Unlock()
+
 	if pa.used.Has(port) {
 		pa.used.Delete(port)
 		pa.reserved.Insert(port)

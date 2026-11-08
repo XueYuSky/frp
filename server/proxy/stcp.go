@@ -15,30 +15,34 @@
 package proxy
 
 import (
-	"github.com/fatedier/frp/pkg/config"
+	"reflect"
+
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 )
+
+func init() {
+	RegisterProxyFactory(reflect.TypeFor[*v1.STCPProxyConfig](), NewSTCPProxy)
+}
 
 type STCPProxy struct {
 	*BaseProxy
-	cfg *config.STCPProxyConf
+	cfg *v1.STCPProxyConfig
+}
+
+func NewSTCPProxy(baseProxy *BaseProxy) Proxy {
+	unwrapped, ok := baseProxy.GetConfigurer().(*v1.STCPProxyConfig)
+	if !ok {
+		return nil
+	}
+	return &STCPProxy{
+		BaseProxy: baseProxy,
+		cfg:       unwrapped,
+	}
 }
 
 func (pxy *STCPProxy) Run() (remoteAddr string, err error) {
-	xl := pxy.xl
-	listener, errRet := pxy.rc.VisitorManager.Listen(pxy.GetName(), pxy.cfg.Sk)
-	if errRet != nil {
-		err = errRet
-		return
-	}
-	pxy.listeners = append(pxy.listeners, listener)
-	xl.Info("stcp proxy custom listen success")
-
-	pxy.startListenHandler(pxy, HandleUserTCPConnection)
+	err = pxy.startVisitorListener(pxy.cfg.Secretkey, pxy.cfg.AllowUsers, "stcp")
 	return
-}
-
-func (pxy *STCPProxy) GetConf() config.ProxyConf {
-	return pxy.cfg
 }
 
 func (pxy *STCPProxy) Close() {
